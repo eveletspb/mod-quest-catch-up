@@ -1,0 +1,4 @@
+# Enable experimental progress transfer on a test realm.
+# Transfers supported quest history only. Item rewards and quests with special
+# turn-in effects are excluded. Leave disabled for regular play.
+QuestCatchUp.ProgressOnly = 0
