@@ -9,7 +9,6 @@
 #include "QuestDef.h"
 #include "ScriptMgr.h"
 #include "WorldSession.h"
-#include <chrono>
 #include <cstdlib>
 #include <unordered_map>
 #include <unordered_set>
@@ -18,18 +17,6 @@ using namespace Acore::ChatCommands;
 
 namespace
 {
-    using Clock = std::chrono::steady_clock;
-
-    struct Request
-    {
-        ObjectGuid Recipient;
-        Clock::time_point Expires;
-        bool Apply;
-    };
-
-    // Player chat commands run on the world thread.
-    std::unordered_map<ObjectGuid, Request> pendingRequests;
-
     struct QuestHistory
     {
         explicit QuestHistory(Player& player) : Rewarded(player.getRewardedQuests()), Active(player.getQuestStatusMap()) { }
@@ -78,7 +65,7 @@ namespace
     AsyncCallbackProcessor<TransactionCallback> transactionCallbacks;
     bool progressOnlyEnabled = false;
 
-    bool CanPreview(Player const& recipient, Player const& source)
+    bool CanUseSource(Player const& recipient, Player const& source)
     {
         return &recipient != &source && recipient.IsInWorld() && source.IsInWorld() &&
             recipient.GetTeamId(true) == source.GetTeamId(true) &&
@@ -148,7 +135,7 @@ namespace
             return;
         }
 
-        if (!recipient || !source || !CanPreview(*recipient, *source) ||
+        if (!recipient || !source || !CanUseSource(*recipient, *source) ||
             !transfer.SourceHistory.Matches(*source) || !transfer.RecipientHistory.Matches(*recipient))
         {
             FinishTransfer(guid, "A participant left or quest progress changed. Request catch-up again.");
@@ -237,7 +224,7 @@ namespace
         });
     }
 
-    bool RequestCatchUp(ChatHandler* handler, bool apply)
+    bool RunCatchUp(ChatHandler* handler, bool apply)
     {
         Player* recipient = handler->GetPlayer();
         if (apply && !progressOnlyEnabled)
@@ -247,64 +234,30 @@ namespace
         }
 
         Player* source = recipient->GetSelectedPlayer();
-        if (!source || !CanPreview(*recipient, *source))
+        if (!source || !CanUseSource(*recipient, *source))
         {
             handler->SendSysMessage("Select a character from your faction in your group.");
             return true;
         }
 
-        Clock::time_point const now = Clock::now();
-        std::erase_if(pendingRequests, [now](auto const& entry) { return entry.second.Expires <= now; });
-        if (!pendingRequests.try_emplace(source->GetGUID(), Request{
-                recipient->GetGUID(), now + std::chrono::minutes(1), apply}).second)
-        {
-            handler->SendSysMessage("That character already has a pending quest catch-up request.");
-            return true;
-        }
-
-        ChatHandler(source->GetSession()).PSendSysMessage(
-            "{} requests quest catch-up {}. Use .questcatchup accept within one minute.",
-            recipient->GetName(), apply ? "transfer" : "preview");
-        handler->PSendSysMessage("Quest catch-up requested from {}.", source->GetName());
-        return true;
-    }
-
-    bool AcceptRequest(ChatHandler* handler)
-    {
-        Player* source = handler->GetPlayer();
-        auto const request = pendingRequests.extract(source->GetGUID());
-        if (request.empty() || request.mapped().Expires <= Clock::now())
-        {
-            handler->SendSysMessage("You have no pending quest catch-up request.");
-            return true;
-        }
-
-        Player* recipient = ObjectAccessor::FindConnectedPlayer(request.mapped().Recipient);
-        if (!recipient || !CanPreview(*recipient, *source))
-        {
-            handler->SendSysMessage("The player who requested quest catch-up is no longer available in your group.");
-            return true;
-        }
-
         auto missing = FindMissingQuests(*source, *recipient);
-        if (request.mapped().Apply)
+        if (apply)
         {
-            if (!progressOnlyEnabled || !transfers.try_emplace(recipient->GetGUID(), *source, *recipient,
-                std::move(missing)).second)
+            ObjectGuid const recipientGuid = recipient->GetGUID();
+            if (!transfers.try_emplace(recipientGuid, *source, *recipient, std::move(missing)).second)
             {
-                handler->SendSysMessage("Quest catch-up transfer is unavailable or already running.");
+                handler->SendSysMessage("Quest catch-up transfer is already running.");
                 return true;
             }
 
-            handler->PSendSysMessage("Quest catch-up approved for {}.", recipient->GetName());
-            ApplyNextBatch(recipient->GetGUID());
+            handler->PSendSysMessage("Quest catch-up with {} started.", source->GetName());
+            ApplyNextBatch(recipientGuid);
             return true;
         }
 
-        ChatHandler(recipient->GetSession()).PSendSysMessage(
+        handler->PSendSysMessage(
             "Quest catch-up preview with {}: {} completed chain quest(s) missing from your history.",
             source->GetName(), missing.size());
-        handler->PSendSysMessage("Quest catch-up preview shared with {}.", recipient->GetName());
         return true;
     }
 
@@ -318,15 +271,14 @@ namespace
             static ChatCommandTable subcommands =
             {
                 { "preview", Preview, SEC_PLAYER, Console::No },
-                { "request", Apply, SEC_PLAYER, Console::No },
-                { "accept", AcceptRequest, SEC_PLAYER, Console::No }
+                { "request", Apply, SEC_PLAYER, Console::No }
             };
             return { { "questcatchup", subcommands } };
         }
 
     private:
-        static bool Preview(ChatHandler* handler) { return RequestCatchUp(handler, false); }
-        static bool Apply(ChatHandler* handler) { return RequestCatchUp(handler, true); }
+        static bool Preview(ChatHandler* handler) { return RunCatchUp(handler, false); }
+        static bool Apply(ChatHandler* handler) { return RunCatchUp(handler, true); }
     };
 
     class QuestCatchUpWorld : public WorldScript
