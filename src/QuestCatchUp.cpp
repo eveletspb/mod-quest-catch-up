@@ -5,6 +5,7 @@
 #include "Config.h"
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
+#include "GameEventMgr.h"
 #include "GameTime.h"
 #include "Item.h"
 #include "Log.h"
@@ -33,14 +34,30 @@ using namespace Acore::ChatCommands;
 
 namespace
 {
+    bool CompletedThisSeason(Player const& player, Quest const& quest)
+    {
+        uint16 const event = quest.GetEventIdForQuest();
+        return (!event || sGameEventMgr->IsActiveEvent(event)) && !player.SatisfyQuestSeasonal(&quest, false);
+    }
+
     struct QuestHistory
     {
-        explicit QuestHistory(Player& player) : Rewarded(player.getRewardedQuests()), Active(player.getQuestStatusMap()) { }
+        explicit QuestHistory(Player& player) : Rewarded(player.getRewardedQuests()), Active(player.getQuestStatusMap())
+        {
+            for (uint32 id : Rewarded)
+                if (Quest const* quest = sObjectMgr->GetQuestTemplate(id); quest && quest->IsSeasonal())
+                    Seasonal.emplace(id, CompletedThisSeason(player, *quest));
+        }
 
         bool Matches(Player& player) const
         {
             if (Rewarded != player.getRewardedQuests() || Active.size() != player.getQuestStatusMap().size())
                 return false;
+
+            for (auto const& [id, completed] : Seasonal)
+                if (Quest const* quest = sObjectMgr->GetQuestTemplate(id);
+                    !quest || CompletedThisSeason(player, *quest) != completed)
+                    return false;
 
             for (auto const& [id, expected] : Active)
             {
@@ -60,6 +77,7 @@ namespace
 
         RewardedQuestSet Rewarded;
         QuestStatusMap Active;
+        std::unordered_map<uint32, bool> Seasonal;
     };
 
     struct Transfer
@@ -118,10 +136,9 @@ namespace
     std::mutex pendingBatchesMutex;
     std::unordered_map<ObjectGuid, PendingBatch> pendingBatches;
 
-    bool IsPermanentQuest(Quest const& quest)
+    bool SupportsQuestHistoryTransfer(Quest const& quest)
     {
-        return !quest.IsRepeatable() && !quest.IsDailyOrWeekly() && !quest.IsMonthly() && !quest.IsSeasonal() &&
-            !quest.IsDFQuest();
+        return !quest.IsDailyOrWeekly() && !quest.IsMonthly() && !quest.IsDFQuest();
     }
 
     void StageQuestReputation(Player& recipient, Quest const& quest, Transfer& transfer)
@@ -157,8 +174,9 @@ namespace
             if (!amount)
                 continue;
 
-            amount = recipient.CalculateReputationGain(REPUTATION_SOURCE_QUEST, recipient.GetQuestLevel(&quest), amount, id);
-            sScriptMgr->OnPlayerGiveReputation(&recipient, id, amount, REPUTATION_SOURCE_QUEST);
+            ReputationSource const source = quest.IsRepeatable() ? REPUTATION_SOURCE_REPEATABLE_QUEST : REPUTATION_SOURCE_QUEST;
+            amount = recipient.CalculateReputationGain(source, recipient.GetQuestLevel(&quest), amount, id);
+            sScriptMgr->OnPlayerGiveReputation(&recipient, id, amount, source);
             amount *= sWorld->getRate(RATE_REPUTATION_GAIN);
             if (!std::isfinite(amount) || !amount)
                 continue;
@@ -498,7 +516,11 @@ namespace
     void ApplyCommittedBatch(Player& player, std::vector<uint32> const& quests)
     {
         for (uint32 id : quests)
+        {
             player.SetRewardedQuest(id);
+            if (Quest const* quest = sObjectMgr->GetQuestTemplate(id); quest && quest->IsSeasonal())
+                player.SetSeasonalQuestStatus(id);
+        }
 
         bool updatePvP = false;
         uint32 talentPoints = 0;
@@ -588,7 +610,11 @@ namespace
         for (uint32 id : source.getRewardedQuests())
         {
             Quest const* quest = sObjectMgr->GetQuestTemplate(id);
-            if (quest && chainQuests.contains(id) && !quest->IsDaily() && !recipient.IsQuestRewarded(id))
+            if (!quest || !chainQuests.contains(id) || quest->IsDaily())
+                continue;
+
+            if (quest->IsSeasonal() ? CompletedThisSeason(source, *quest) && !CompletedThisSeason(recipient, *quest) :
+                !recipient.IsQuestRewarded(id))
                 missing.push_back(id);
         }
         std::ranges::sort(missing);
@@ -674,7 +700,10 @@ namespace
         for (uint32 id : transfer.Remaining)
         {
             Quest const* quest = sObjectMgr->GetQuestTemplate(id);
-            if (!quest || !IsPermanentQuest(*quest))
+            if (!quest || !SupportsQuestHistoryTransfer(*quest))
+                continue;
+
+            if (quest->IsSeasonal() && !CompletedThisSeason(*source, *quest))
                 continue;
 
             if (recipient->GetQuestStatus(id) == QUEST_STATUS_NONE && !recipient->CanTakeQuest(quest, false))
@@ -684,10 +713,13 @@ namespace
             if (group > 0 && exclusiveGroups.contains(group))
                 continue;
 
-            if (!AppendItemRewards(transaction, *recipient, *quest, transfer))
-                continue;
-            AppendQuestTemplateMail(transaction, *recipient, *quest, transfer);
-            StageQuestReputation(*recipient, *quest, transfer);
+            if (!recipient->IsQuestRewarded(id))
+            {
+                if (!AppendItemRewards(transaction, *recipient, *quest, transfer))
+                    continue;
+                AppendQuestTemplateMail(transaction, *recipient, *quest, transfer);
+                StageQuestReputation(*recipient, *quest, transfer);
+            }
 
             if (group > 0)
                 exclusiveGroups.insert(group);
@@ -697,6 +729,15 @@ namespace
             insert->SetData(0, guid.GetRawValue());
             insert->SetData(1, id);
             transaction->Append(insert);
+
+            if (quest->IsSeasonal())
+            {
+                auto* seasonal = CharacterDatabase.GetPreparedStatement(CHAR_INS_CHARACTER_SEASONALQUESTSTATUS);
+                seasonal->SetData(0, guid.GetRawValue());
+                seasonal->SetData(1, id);
+                seasonal->SetData(2, quest->GetEventIdForQuest());
+                transaction->Append(seasonal);
+            }
             auto* removeActive = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHAR_QUESTSTATUS_BY_QUEST);
             removeActive->SetData(0, guid.GetRawValue());
             removeActive->SetData(1, id);
@@ -773,7 +814,7 @@ namespace
             completed.Committed += static_cast<uint32>(completed.InFlight.size());
             std::erase_if(completed.Remaining, [&completed](uint32 id)
             {
-                return completed.RecipientHistory.Rewarded.contains(id);
+                return std::ranges::find(completed.InFlight, id) != completed.InFlight.end();
             });
             completed.InFlight.clear();
 
@@ -795,13 +836,16 @@ namespace
 
             // A disconnected COMMIT can return an error after the server has already saved the transaction.
             auto holder = std::make_shared<SQLQueryHolder<CharacterDatabaseConnection>>();
-            holder->SetSize(2);
+            holder->SetSize(3);
             auto* character = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER);
             character->SetData(0, guid.GetRawValue());
             holder->SetPreparedQuery(0, character);
             auto* rewarded = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_QUESTSTATUSREW);
             rewarded->SetData(0, guid.GetRawValue());
             holder->SetPreparedQuery(1, rewarded);
+            auto* seasonal = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_SEASONALQUESTSTATUS);
+            seasonal->SetData(0, guid.GetRawValue());
+            holder->SetPreparedQuery(2, seasonal);
 
             recoveryCallbacks.AddCallback(CharacterDatabase.DelayQueryHolder(holder)).AfterComplete(
                 [guid, complete](SQLQueryHolderBase const& result)
@@ -814,15 +858,36 @@ namespace
                 }
 
                 auto const& inFlight = transfers.at(guid).InFlight;
+                RewardedQuestSet seasonalCompletions;
+                if (auto seasonalRows = result.GetPreparedResult(2))
+                {
+                    do
+                    {
+                        auto const* fields = seasonalRows->Fetch();
+                        uint32 const id = fields[0].Get<uint32>();
+                        if (Quest const* quest = sObjectMgr->GetQuestTemplate(id); quest &&
+                            fields[1].Get<uint16>() == quest->GetEventIdForQuest())
+                            seasonalCompletions.insert(id);
+                    }
+                    while (seasonalRows->NextRow());
+                }
+
                 std::size_t saved = 0;
+                bool unknown = false;
                 do
                 {
                     uint32 const id = rows->Fetch()[0].Get<uint32>();
-                    saved += std::ranges::find(inFlight, id) != inFlight.end();
+                    if (std::ranges::find(inFlight, id) == inFlight.end())
+                        continue;
+                    if (Quest const* quest = sObjectMgr->GetQuestTemplate(id); quest && quest->IsSeasonal() &&
+                        !seasonalCompletions.contains(id))
+                        unknown = true;
+                    else
+                        ++saved;
                 }
                 while (rows->NextRow());
 
-                complete(saved == inFlight.size(), saved != 0 && saved != inFlight.size());
+                complete(saved == inFlight.size(), unknown || (saved != 0 && saved != inFlight.size()));
             });
         });
     }
@@ -1036,7 +1101,9 @@ namespace
             std::vector<uint32> obsolete;
             for (auto const& [id, status] : player->getQuestStatusMap())
                 if (player->IsQuestRewarded(id))
-                    if (Quest const* quest = sObjectMgr->GetQuestTemplate(id); quest && IsPermanentQuest(*quest))
+                    if (Quest const* quest = sObjectMgr->GetQuestTemplate(id); quest &&
+                        SupportsQuestHistoryTransfer(*quest) && !quest->IsRepeatable() &&
+                        (!quest->IsSeasonal() || !player->SatisfyQuestSeasonal(quest, false)))
                         obsolete.push_back(id);
 
             for (uint32 id : obsolete)
