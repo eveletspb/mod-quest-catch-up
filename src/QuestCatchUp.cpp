@@ -4,9 +4,11 @@
 #include "ChatCommand.h"
 #include "Config.h"
 #include "DatabaseEnv.h"
+#include "DBCStores.h"
 #include "GameTime.h"
 #include "Item.h"
 #include "Log.h"
+#include "LootMgr.h"
 #include "Mail.h"
 #include "MailMgr.h"
 #include "ObjectAccessor.h"
@@ -91,6 +93,7 @@ namespace
     AsyncCallbackProcessor<TransactionCallback> transactionCallbacks;
     AsyncCallbackProcessor<SQLQueryHolderCallback> recoveryCallbacks;
     std::unordered_set<ObjectGuid> needsRelog;
+    std::unordered_map<ObjectGuid, uint32> loadedQuestTalentRewards;
     bool progressOnlyEnabled = false;
 
     struct PendingBatch
@@ -108,6 +111,74 @@ namespace
     {
         return !quest.IsRepeatable() && !quest.IsDailyOrWeekly() && !quest.IsMonthly() && !quest.IsSeasonal() &&
             !quest.IsDFQuest();
+    }
+
+    void AppendRewardMail(CharacterDatabaseTransaction const& transaction, Transfer::RewardMail& reward)
+    {
+        Mail& mail = *reward.Letter;
+        mail.messageID = sObjectMgr->GenerateMailID();
+        mail.expire_time = mail.deliver_time + 30 * DAY;
+        mail.state = MAIL_STATE_UNCHANGED;
+
+        auto* insert = CharacterDatabase.GetPreparedStatement(CHAR_INS_MAIL);
+        insert->SetData(0, mail.messageID);
+        insert->SetData(1, mail.messageType);
+        insert->SetData(2, mail.stationery);
+        insert->SetData(3, mail.mailTemplateId);
+        insert->SetData(4, mail.sender);
+        insert->SetData(5, mail.receiver);
+        insert->SetData(6, mail.subject);
+        insert->SetData(7, mail.body);
+        insert->SetData(8, !reward.Attachments.empty());
+        insert->SetData(9, uint32(mail.expire_time));
+        insert->SetData(10, uint32(mail.deliver_time));
+        insert->SetData(11, mail.money);
+        insert->SetData(12, mail.COD);
+        insert->SetData(13, uint8(mail.checked));
+        transaction->Append(insert);
+
+        for (auto const& item : reward.Attachments)
+        {
+            item->SaveToDB(transaction);
+            auto const itemGuid = item->GetGUID().GetCounter();
+            mail.AddItem(itemGuid, item->GetEntry());
+            auto* attachment = CharacterDatabase.GetPreparedStatement(CHAR_INS_MAIL_ITEM);
+            attachment->SetData(0, mail.messageID);
+            attachment->SetData(1, itemGuid);
+            attachment->SetData(2, mail.receiver);
+            transaction->Append(attachment);
+        }
+    }
+
+    void AppendQuestTemplateMail(CharacterDatabaseTransaction const& transaction, Player& recipient,
+        Quest const& quest, Transfer& transfer)
+    {
+        uint16 const templateId = quest.GetRewMailTemplateId();
+        if (!templateId)
+            return;
+
+        Transfer::RewardMail reward{std::make_unique<Mail>(), {}};
+        Mail& mail = *reward.Letter;
+        mail.mailTemplateId = templateId;
+        mail.messageType = MAIL_CREATURE;
+        mail.stationery = MAIL_STATIONERY_DEFAULT;
+        mail.sender = quest.GetRewMailSenderEntry() ? quest.GetRewMailSenderEntry() : 34337;
+        mail.receiver = recipient.GetGUID().GetCounter();
+        mail.deliver_time = GameTime::GetGameTime().count() + quest.GetRewMailDelaySecs();
+        mail.checked = MAIL_CHECK_MASK_HAS_BODY;
+        if (templateId == 123) // The Wrath of Neptulon, also handled by MailDraft.
+            mail.money = 100 * GOLD;
+
+        Loot loot;
+        loot.FillLoot(templateId, LootTemplates_Mail, &recipient, true, true);
+        uint32 const slots = loot.GetMaxSlotInLootFor(&recipient);
+        for (uint32 slot = 0; slot < slots && reward.Attachments.size() < MAX_MAIL_ITEMS; ++slot)
+            if (LootItem* entry = loot.LootItemInSlot(slot, &recipient))
+                if (Item* item = Item::CreateItem(entry->itemid, entry->count, &recipient))
+                    reward.Attachments.emplace_back(item);
+
+        AppendRewardMail(transaction, reward);
+        transfer.RewardMails.push_back(std::move(reward));
     }
 
     void FinishInventoryReward(Player& recipient, Transfer::InventoryReward const& reward, bool saved)
@@ -271,7 +342,6 @@ namespace
         for (auto& reward : staged)
         {
             Mail& mail = *reward.Letter;
-            mail.messageID = sObjectMgr->GenerateMailID();
             mail.messageType = MAIL_CREATURE;
             mail.stationery = MAIL_STATIONERY_DEFAULT;
             mail.sender = 34337; // The Postmaster.
@@ -279,39 +349,8 @@ namespace
             mail.subject = "Quest catch-up rewards";
             mail.body = quest.GetTitle();
             mail.deliver_time = GameTime::GetGameTime().count();
-            mail.expire_time = mail.deliver_time + 30 * DAY;
             mail.checked = MAIL_CHECK_MASK_COPIED;
-            mail.state = MAIL_STATE_UNCHANGED;
-
-            auto* insert = CharacterDatabase.GetPreparedStatement(CHAR_INS_MAIL);
-            insert->SetData(0, mail.messageID);
-            insert->SetData(1, mail.messageType);
-            insert->SetData(2, mail.stationery);
-            insert->SetData(3, mail.mailTemplateId);
-            insert->SetData(4, mail.sender);
-            insert->SetData(5, mail.receiver);
-            insert->SetData(6, mail.subject);
-            insert->SetData(7, mail.body);
-            insert->SetData(8, true);
-            insert->SetData(9, uint32(mail.expire_time));
-            insert->SetData(10, uint32(mail.deliver_time));
-            insert->SetData(11, mail.money);
-            insert->SetData(12, mail.COD);
-            insert->SetData(13, uint8(mail.checked));
-            transaction->Append(insert);
-
-            for (auto const& item : reward.Attachments)
-            {
-                item->SaveToDB(transaction);
-                auto const itemGuid = item->GetGUID().GetCounter();
-                mail.AddItem(itemGuid, item->GetEntry());
-                auto* attachment = CharacterDatabase.GetPreparedStatement(CHAR_INS_MAIL_ITEM);
-                attachment->SetData(0, mail.messageID);
-                attachment->SetData(1, itemGuid);
-                attachment->SetData(2, mail.receiver);
-                transaction->Append(attachment);
-            }
-
+            AppendRewardMail(transaction, reward);
             transfer.RewardMails.push_back(std::move(reward));
         }
 
@@ -337,6 +376,7 @@ namespace
 
     void RemoveJournalEntry(Player& player, uint32 id)
     {
+        player.RemoveTimedQuest(id);
         uint16 const slot = player.FindQuestSlot(id);
         if (slot < MAX_QUEST_LOG_SIZE)
         {
@@ -352,14 +392,36 @@ namespace
             player.SetRewardedQuest(id);
 
         bool updatePvP = false;
+        uint32 talentPoints = 0;
         for (uint32 id : quests)
         {
+            Quest const* quest = sObjectMgr->GetQuestTemplate(id);
             if (player.getQuestStatusMap().contains(id))
             {
-                if (Quest const* quest = sObjectMgr->GetQuestTemplate(id))
+                if (quest)
                     updatePvP |= quest->HasFlag(QUEST_FLAGS_FLAGS_PVP);
                 RemoveJournalEntry(player, id);
             }
+
+            if (!quest)
+                continue;
+
+            // These rewards can be reconstructed from completed history at login.
+            player.learnQuestRewardedSpells(quest);
+            if (quest->GetCharTitleId())
+                if (CharTitlesEntry const* title = sCharTitlesStore.LookupEntry(quest->GetCharTitleId()))
+                    player.SetTitle(title);
+            talentPoints += quest->GetBonusTalents();
+        }
+
+        if (talentPoints)
+        {
+            {
+                std::lock_guard lock(pendingBatchesMutex);
+                loadedQuestTalentRewards[player.GetGUID()] += talentPoints;
+            }
+            player.InitTalentForLevel();
+            player.SendTalentsInfoData(false);
         }
 
         if (updatePvP)
@@ -503,9 +565,7 @@ namespace
         for (uint32 id : transfer.Remaining)
         {
             Quest const* quest = sObjectMgr->GetQuestTemplate(id);
-            if (!quest || !IsPermanentQuest(*quest) || quest->HasSpecialFlag(QUEST_SPECIAL_FLAGS_TIMED) ||
-                quest->GetRewMailTemplateId() ||
-                quest->GetRewSpell() || quest->GetRewSpellCast() || quest->GetCharTitleId() || quest->GetBonusTalents())
+            if (!quest || !IsPermanentQuest(*quest))
                 continue;
 
             if (recipient->GetQuestStatus(id) == QUEST_STATUS_NONE && !recipient->CanTakeQuest(quest, false))
@@ -517,6 +577,7 @@ namespace
 
             if (!AppendItemRewards(transaction, *recipient, *quest, transfer))
                 continue;
+            AppendQuestTemplateMail(transaction, *recipient, *quest, transfer);
 
             if (group > 0)
                 exclusiveGroups.insert(group);
@@ -816,11 +877,34 @@ namespace
     {
     public:
         QuestCatchUpPlayer() : PlayerScript("QuestCatchUpPlayer",
-            { PLAYERHOOK_ON_LOGIN, PLAYERHOOK_ON_BEFORE_QUEST_COMPLETE }) { }
+            { PLAYERHOOK_ON_LOGIN, PLAYERHOOK_ON_LOGOUT, PLAYERHOOK_ON_BEFORE_QUEST_COMPLETE,
+                PLAYERHOOK_ON_CALCULATE_TALENTS_POINTS }) { }
 
         bool OnPlayerBeforeQuestComplete(Player* player, uint32 id) override
         {
             return !BlockPendingQuest(player->GetGUID(), id);
+        }
+
+        void OnPlayerCalculateTalentsPoints(Player const* player, uint32& points) override
+        {
+            if (player->GetMapId() != MAP_EBON_HOLD ||
+                !player->IsClass(CLASS_DEATH_KNIGHT, CLASS_CONTEXT_TALENT_POINT_CALC))
+                return;
+
+            std::lock_guard lock(pendingBatchesMutex);
+            auto const found = loadedQuestTalentRewards.find(player->GetGUID());
+            if (found == loadedQuestTalentRewards.end())
+                return;
+
+            uint32 const base = player->GetLevel() >= 10 ? player->GetLevel() - 9 : 0;
+            uint32 const cap = base + const_cast<Player*>(player)->GetBonusTalentCount();
+            points += std::min(found->second, cap > points ? cap - points : 0);
+        }
+
+        void OnPlayerLogout(Player* player) override
+        {
+            std::lock_guard lock(pendingBatchesMutex);
+            loadedQuestTalentRewards.erase(player->GetGUID());
         }
 
         void OnPlayerLogin(Player* player) override
@@ -828,6 +912,7 @@ namespace
             {
                 std::lock_guard lock(pendingBatchesMutex);
                 needsRelog.erase(player->GetGUID());
+                loadedQuestTalentRewards.erase(player->GetGUID());
             }
             if (!progressOnlyEnabled)
                 return;
