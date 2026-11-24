@@ -5,11 +5,14 @@
 #include "DatabaseEnv.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
+#include "Opcodes.h"
 #include "Player.h"
 #include "QuestDef.h"
 #include "ScriptMgr.h"
+#include "WorldPacket.h"
 #include "WorldSession.h"
 #include <cstdlib>
+#include <mutex>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -65,6 +68,64 @@ namespace
     std::unordered_map<ObjectGuid, Transfer> transfers;
     AsyncCallbackProcessor<TransactionCallback> transactionCallbacks;
     bool progressOnlyEnabled = false;
+
+    struct PendingBatch
+    {
+        std::vector<uint32> Quests;
+        bool TurnInAttempted = false;
+    };
+
+    // Quest packets and objective updates may run on the map update threads.
+    std::mutex pendingBatchesMutex;
+    std::unordered_map<ObjectGuid, PendingBatch> pendingBatches;
+
+    bool IsPermanentQuest(Quest const& quest)
+    {
+        return !quest.IsRepeatable() && !quest.IsDailyOrWeekly() && !quest.IsMonthly() && !quest.IsSeasonal() &&
+            !quest.IsDFQuest();
+    }
+
+    void RemoveJournalEntry(Player& player, uint32 id)
+    {
+        uint16 const slot = player.FindQuestSlot(id);
+        if (slot < MAX_QUEST_LOG_SIZE)
+        {
+            player.SetQuestSlot(slot, 0);
+            player.RemoveTimedAchievement(ACHIEVEMENT_TIMED_TYPE_QUEST, id);
+        }
+        player.RemoveActiveQuest(id, false);
+    }
+
+    void ApplyCommittedBatch(Player& player, std::vector<uint32> const& quests)
+    {
+        for (uint32 id : quests)
+            player.SetRewardedQuest(id);
+
+        bool updatePvP = false;
+        for (uint32 id : quests)
+        {
+            if (player.getQuestStatusMap().contains(id))
+            {
+                if (Quest const* quest = sObjectMgr->GetQuestTemplate(id))
+                    updatePvP |= quest->HasFlag(QUEST_FLAGS_FLAGS_PVP);
+                RemoveJournalEntry(player, id);
+            }
+        }
+
+        if (updatePvP)
+        {
+            player.pvpInfo.IsHostile = player.pvpInfo.IsInHostileArea || player.HasPvPForcingQuest();
+            player.UpdatePvPState();
+        }
+
+        for (uint32 id : quests)
+            player.SendQuestUpdate(id);
+
+        player.UpdateZoneDependentAuras(player.GetZoneId());
+        player.UpdateAreaDependentAuras(player.GetAreaId());
+        WorldPacket query(CMSG_QUESTGIVER_STATUS_MULTIPLE_QUERY);
+        player.GetSession()->HandleQuestgiverStatusMultipleQuery(query);
+    }
 
     bool CanUseSource(Player const& recipient, Player const& source)
     {
@@ -186,18 +247,16 @@ namespace
         for (uint32 id : transfer.Remaining)
         {
             Quest const* quest = sObjectMgr->GetQuestTemplate(id);
-            if (!quest || quest->IsRepeatable() || quest->IsWeekly() || quest->IsMonthly() || quest->IsSeasonal() ||
-                quest->IsDFQuest() || quest->HasSpecialFlag(QUEST_SPECIAL_FLAGS_TIMED) ||
+            if (!quest || !IsPermanentQuest(*quest) || quest->HasSpecialFlag(QUEST_SPECIAL_FLAGS_TIMED) ||
                 quest->GetRewItemsCount() || quest->GetRewChoiceItemsCount() || quest->GetRewMailTemplateId() ||
-                quest->GetRewSpell() || quest->GetRewSpellCast() || quest->GetCharTitleId() || quest->GetBonusTalents() ||
-                !recipient->CanTakeQuest(quest, false))
+                quest->GetRewSpell() || quest->GetRewSpellCast() || quest->GetCharTitleId() || quest->GetBonusTalents())
+                continue;
+
+            if (recipient->GetQuestStatus(id) == QUEST_STATUS_NONE && !recipient->CanTakeQuest(quest, false))
                 continue;
 
             int32 const group = quest->GetExclusiveGroup();
             if (group > 0 && exclusiveGroups.contains(group))
-                continue;
-
-            if (!recipient->ReserveQuestHistoryTransfer(id))
                 continue;
 
             if (group > 0)
@@ -229,19 +288,30 @@ namespace
             return;
         }
 
+        {
+            std::lock_guard lock(pendingBatchesMutex);
+            pendingBatches.emplace(guid, PendingBatch{transfer.InFlight});
+        }
+
         transactionCallbacks.AddCallback(CharacterDatabase.AsyncCommitTransaction(transaction)).AfterComplete([guid](bool success)
         {
             auto& completed = transfers.at(guid);
             Player* player = ObjectAccessor::FindConnectedPlayer(guid);
+            bool turnInAttempted;
+            {
+                std::lock_guard lock(pendingBatchesMutex);
+                turnInAttempted = pendingBatches.extract(guid).mapped().TurnInAttempted;
+            }
             bool const progressChanged = player && !completed.RecipientHistory.Matches(*player);
-            if (player)
-                player->ReleaseQuestHistoryTransfers(completed.InFlight, success);
 
             if (!success)
             {
                 FinishTransfer(guid, "The database could not save the last batch. Request catch-up again.");
                 return;
             }
+
+            if (player)
+                ApplyCommittedBatch(*player, completed.InFlight);
 
             for (uint32 id : completed.InFlight)
             {
@@ -255,7 +325,7 @@ namespace
             });
             completed.InFlight.clear();
 
-            if (progressChanged)
+            if (progressChanged || turnInAttempted)
             {
                 FinishTransfer(guid, "Quest progress changed while saving. Request catch-up again.");
                 return;
@@ -341,17 +411,95 @@ namespace
         void OnUpdate(uint32) override { transactionCallbacks.ProcessReadyCallbacks(); }
     };
 
+    bool BlockPendingQuest(ObjectGuid guid, uint32 questId, bool turnIn = false)
+    {
+        std::lock_guard lock(pendingBatchesMutex);
+        auto const batch = pendingBatches.find(guid);
+        if (batch == pendingBatches.end() || std::ranges::find(batch->second.Quests, questId) == batch->second.Quests.end())
+            return false;
+
+        batch->second.TurnInAttempted |= turnIn;
+        return true;
+    }
+
+    class QuestCatchUpPackets : public ServerScript
+    {
+    public:
+        QuestCatchUpPackets() : ServerScript("QuestCatchUpPackets", { SERVERHOOK_CAN_PACKET_RECEIVE }) { }
+
+        bool CanPacketReceive(WorldSession* session, WorldPacket const& packet) override
+        {
+            if (!session)
+                return true;
+
+            auto const opcode = packet.GetOpcode();
+            if (opcode == CMSG_PLAYER_LOGIN && packet.size() >= sizeof(uint64))
+            {
+                ObjectGuid const guid(packet.read<uint64>(packet.rpos()));
+                {
+                    std::lock_guard lock(pendingBatchesMutex);
+                    if (!pendingBatches.contains(guid))
+                        return true;
+                }
+                session->SendCharLoginFailed(LoginFailureReason::LockedForTransfer);
+                return false;
+            }
+
+            Player* player = session->GetPlayer();
+            if (!player)
+                return true;
+
+            if (opcode == CMSG_QUESTLOG_REMOVE_QUEST && packet.size() >= sizeof(uint8))
+            {
+                uint8 const slot = packet.read<uint8>(packet.rpos());
+                return slot >= MAX_QUEST_LOG_SIZE ||
+                    !BlockPendingQuest(player->GetGUID(), player->GetQuestSlotQuestId(slot));
+            }
+
+            if (opcode == CMSG_QUEST_CONFIRM_ACCEPT && packet.size() >= sizeof(uint32))
+                return !BlockPendingQuest(player->GetGUID(), packet.read<uint32>(packet.rpos()));
+
+            bool const turnIn = opcode == CMSG_QUESTGIVER_CHOOSE_REWARD || opcode == CMSG_QUESTGIVER_COMPLETE_QUEST ||
+                opcode == CMSG_QUESTGIVER_REQUEST_REWARD;
+            if ((turnIn || opcode == CMSG_QUESTGIVER_ACCEPT_QUEST || opcode == CMSG_QUESTGIVER_QUERY_QUEST) &&
+                packet.size() >= sizeof(uint64) + sizeof(uint32))
+            {
+                uint32 const id = packet.read<uint32>(packet.rpos() + sizeof(uint64));
+                return !BlockPendingQuest(player->GetGUID(), id, turnIn);
+            }
+
+            return true;
+        }
+    };
+
     class QuestCatchUpPlayer : public PlayerScript
     {
     public:
-        QuestCatchUpPlayer() : PlayerScript("QuestCatchUpPlayer", { PLAYERHOOK_ON_LOGIN }) { }
+        QuestCatchUpPlayer() : PlayerScript("QuestCatchUpPlayer",
+            { PLAYERHOOK_ON_LOGIN, PLAYERHOOK_ON_BEFORE_QUEST_COMPLETE }) { }
+
+        bool OnPlayerBeforeQuestComplete(Player* player, uint32 id) override
+        {
+            return !BlockPendingQuest(player->GetGUID(), id);
+        }
 
         void OnPlayerLogin(Player* player) override
         {
-            auto const transfer = transfers.find(player->GetGUID());
-            if (transfer != transfers.end())
-                for (uint32 id : transfer->second.InFlight)
-                    player->ReserveQuestHistoryTransfer(id);
+            if (!progressOnlyEnabled)
+                return;
+
+            // An older autosave may finish after the transfer's journal delete.
+            std::vector<uint32> obsolete;
+            for (auto const& [id, status] : player->getQuestStatusMap())
+                if (player->IsQuestRewarded(id))
+                    if (Quest const* quest = sObjectMgr->GetQuestTemplate(id); quest && IsPermanentQuest(*quest))
+                        obsolete.push_back(id);
+
+            for (uint32 id : obsolete)
+            {
+                RemoveJournalEntry(*player, id);
+                player->SendQuestUpdate(id);
+            }
         }
     };
 }
@@ -360,5 +508,6 @@ void Addmod_quest_catch_upScripts()
 {
     new QuestCatchUpCommands();
     new QuestCatchUpWorld();
+    new QuestCatchUpPackets();
     new QuestCatchUpPlayer();
 }
