@@ -3,6 +3,10 @@
 #include "ChatCommand.h"
 #include "Config.h"
 #include "DatabaseEnv.h"
+#include "GameTime.h"
+#include "Item.h"
+#include "Mail.h"
+#include "MailMgr.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
@@ -12,6 +16,7 @@
 #include "WorldPacket.h"
 #include "WorldSession.h"
 #include <cstdlib>
+#include <memory>
 #include <mutex>
 #include <string_view>
 #include <unordered_map>
@@ -62,6 +67,12 @@ namespace
         QuestHistory RecipientHistory;
         std::vector<uint32> Remaining;
         std::vector<uint32> InFlight;
+        struct RewardMail
+        {
+            std::unique_ptr<Mail> Letter;
+            std::vector<std::unique_ptr<Item>> Attachments;
+        };
+        std::vector<RewardMail> RewardMails;
         uint32 Committed = 0;
     };
 
@@ -83,6 +94,128 @@ namespace
     {
         return !quest.IsRepeatable() && !quest.IsDailyOrWeekly() && !quest.IsMonthly() && !quest.IsSeasonal() &&
             !quest.IsDFQuest();
+    }
+
+    bool AppendOverflowRewards(CharacterDatabaseTransaction const& transaction, Player const& recipient,
+        Quest const& quest, std::vector<Transfer::RewardMail>& rewardMails)
+    {
+        std::vector<std::pair<uint32, uint32>> rewards;
+        for (uint32 i = 0; i < QUEST_REWARDS_COUNT; ++i)
+            if (quest.RewardItemId[i] && quest.RewardItemIdCount[i])
+                rewards.emplace_back(quest.RewardItemId[i], quest.RewardItemIdCount[i]);
+
+        uint64 bestPrice = 0;
+        uint32 bestChoice = QUEST_REWARD_CHOICES_COUNT;
+        for (uint32 i = 0; i < QUEST_REWARD_CHOICES_COUNT; ++i)
+        {
+            ItemTemplate const* item = sObjectMgr->GetItemTemplate(quest.RewardChoiceItemId[i]);
+            uint32 const count = quest.RewardChoiceItemCount[i];
+            if (!item || !count)
+                continue;
+
+            uint64 const price = uint64(item->SellPrice) * count;
+            if (bestChoice == QUEST_REWARD_CHOICES_COUNT || price > bestPrice)
+            {
+                bestChoice = i;
+                bestPrice = price;
+            }
+        }
+
+        if (bestChoice != QUEST_REWARD_CHOICES_COUNT)
+            rewards.emplace_back(quest.RewardChoiceItemId[bestChoice], quest.RewardChoiceItemCount[bestChoice]);
+        else if (quest.GetRewChoiceItemsCount())
+            return false;
+
+        std::vector<Transfer::RewardMail> staged;
+        for (auto [entry, count] : rewards)
+        {
+            ItemTemplate const* itemTemplate = sObjectMgr->GetItemTemplate(entry);
+            if (!itemTemplate)
+                return false;
+
+            ItemPosCountVec destinations;
+            if (recipient.CanStoreNewItem(NULL_BAG, NULL_SLOT, destinations, entry, count) == EQUIP_ERR_OK)
+                return false;
+
+            while (count)
+            {
+                if (staged.empty() || staged.back().Attachments.size() == MAX_MAIL_ITEMS)
+                    staged.push_back({std::make_unique<Mail>(), {}});
+
+                uint32 const stack = std::min(count, itemTemplate->GetMaxStackSize());
+                std::unique_ptr<Item> item(Item::CreateItem(entry, stack));
+                if (!item)
+                    return false;
+                staged.back().Attachments.push_back(std::move(item));
+                count -= stack;
+            }
+        }
+
+        for (auto& reward : staged)
+        {
+            Mail& mail = *reward.Letter;
+            mail.messageID = sObjectMgr->GenerateMailID();
+            mail.messageType = MAIL_CREATURE;
+            mail.stationery = MAIL_STATIONERY_DEFAULT;
+            mail.sender = 34337; // The Postmaster.
+            mail.receiver = recipient.GetGUID().GetCounter();
+            mail.subject = "Quest catch-up rewards";
+            mail.body = quest.GetTitle();
+            mail.deliver_time = GameTime::GetGameTime().count();
+            mail.expire_time = mail.deliver_time + 30 * DAY;
+            mail.checked = MAIL_CHECK_MASK_COPIED;
+            mail.state = MAIL_STATE_UNCHANGED;
+
+            auto* insert = CharacterDatabase.GetPreparedStatement(CHAR_INS_MAIL);
+            insert->SetData(0, mail.messageID);
+            insert->SetData(1, mail.messageType);
+            insert->SetData(2, mail.stationery);
+            insert->SetData(3, mail.mailTemplateId);
+            insert->SetData(4, mail.sender);
+            insert->SetData(5, mail.receiver);
+            insert->SetData(6, mail.subject);
+            insert->SetData(7, mail.body);
+            insert->SetData(8, true);
+            insert->SetData(9, uint32(mail.expire_time));
+            insert->SetData(10, uint32(mail.deliver_time));
+            insert->SetData(11, mail.money);
+            insert->SetData(12, mail.COD);
+            insert->SetData(13, uint8(mail.checked));
+            transaction->Append(insert);
+
+            for (auto const& item : reward.Attachments)
+            {
+                item->SaveToDB(transaction);
+                auto const itemGuid = item->GetGUID().GetCounter();
+                mail.AddItem(itemGuid, item->GetEntry());
+                auto* attachment = CharacterDatabase.GetPreparedStatement(CHAR_INS_MAIL_ITEM);
+                attachment->SetData(0, mail.messageID);
+                attachment->SetData(1, itemGuid);
+                attachment->SetData(2, mail.receiver);
+                transaction->Append(attachment);
+            }
+
+            rewardMails.push_back(std::move(reward));
+        }
+
+        return true;
+    }
+
+    void PublishRewardMails(Transfer& transfer, Player* recipient)
+    {
+        for (auto& reward : transfer.RewardMails)
+        {
+            sMailMgr->OnMailSent(reward.Letter->receiver);
+            if (!recipient)
+                continue;
+
+            time_t const deliverTime = reward.Letter->deliver_time;
+            recipient->AddMail(reward.Letter.release());
+            for (auto& item : reward.Attachments)
+                recipient->AddMItem(item.release());
+            recipient->AddNewMailDeliverTime(deliverTime);
+        }
+        transfer.RewardMails.clear();
     }
 
     void RemoveJournalEntry(Player& player, uint32 id)
@@ -248,7 +381,7 @@ namespace
         {
             Quest const* quest = sObjectMgr->GetQuestTemplate(id);
             if (!quest || !IsPermanentQuest(*quest) || quest->HasSpecialFlag(QUEST_SPECIAL_FLAGS_TIMED) ||
-                quest->GetRewItemsCount() || quest->GetRewChoiceItemsCount() || quest->GetRewMailTemplateId() ||
+                quest->GetRewMailTemplateId() ||
                 quest->GetRewSpell() || quest->GetRewSpellCast() || quest->GetCharTitleId() || quest->GetBonusTalents())
                 continue;
 
@@ -257,6 +390,9 @@ namespace
 
             int32 const group = quest->GetExclusiveGroup();
             if (group > 0 && exclusiveGroups.contains(group))
+                continue;
+
+            if (!AppendOverflowRewards(transaction, *recipient, *quest, transfer.RewardMails))
                 continue;
 
             if (group > 0)
@@ -312,6 +448,7 @@ namespace
 
             if (player)
                 ApplyCommittedBatch(*player, completed.InFlight);
+            PublishRewardMails(completed, player);
 
             for (uint32 id : completed.InFlight)
             {
