@@ -1,5 +1,5 @@
 # Enable experimental progress transfer on a test realm.
-# Transfers supported quest history and can mail item rewards when bags are full.
-# Quests that need inventory delivery or special turn-in effects are excluded.
+# Transfers supported quest history, puts rewards in bags and mails overflow.
+# Quests with special turn-in effects are excluded.
 # Leave disabled for regular play.
 QuestCatchUp.ProgressOnly = 0

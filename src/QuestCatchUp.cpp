@@ -1,10 +1,12 @@
 #include "AsyncCallbackProcessor.h"
+#include "Bag.h"
 #include "Chat.h"
 #include "ChatCommand.h"
 #include "Config.h"
 #include "DatabaseEnv.h"
 #include "GameTime.h"
 #include "Item.h"
+#include "Log.h"
 #include "Mail.h"
 #include "MailMgr.h"
 #include "ObjectAccessor.h"
@@ -72,18 +74,30 @@ namespace
             std::unique_ptr<Mail> Letter;
             std::vector<std::unique_ptr<Item>> Attachments;
         };
+        struct InventoryReward
+        {
+            ObjectGuid Guid;
+            uint16 Position;
+            uint32 Added;
+            uint32 OriginalCount;
+            ItemUpdateState OriginalState;
+        };
         std::vector<RewardMail> RewardMails;
+        std::vector<InventoryReward> InventoryRewards;
         uint32 Committed = 0;
     };
 
     std::unordered_map<ObjectGuid, Transfer> transfers;
     AsyncCallbackProcessor<TransactionCallback> transactionCallbacks;
+    AsyncCallbackProcessor<SQLQueryHolderCallback> recoveryCallbacks;
+    std::unordered_set<ObjectGuid> needsRelog;
     bool progressOnlyEnabled = false;
 
     struct PendingBatch
     {
         std::vector<uint32> Quests;
         bool TurnInAttempted = false;
+        bool InventoryReserved = false;
     };
 
     // Quest packets and objective updates may run on the map update threads.
@@ -96,8 +110,55 @@ namespace
             !quest.IsDFQuest();
     }
 
-    bool AppendOverflowRewards(CharacterDatabaseTransaction const& transaction, Player const& recipient,
-        Quest const& quest, std::vector<Transfer::RewardMail>& rewardMails)
+    void FinishInventoryReward(Player& recipient, Transfer::InventoryReward const& reward, bool saved)
+    {
+        Item* item = recipient.GetItemByPos(reward.Position);
+        if (!item || item->GetGUID() != reward.Guid)
+        {
+            LOG_ERROR("module.questcatchup", "Reserved item {} moved while saving rewards for {}",
+                reward.Guid.ToString(), recipient.GetGUID().ToString());
+            return;
+        }
+
+        item->SetInTrade(false);
+        item->m_lootGenerated = false;
+        if (!saved)
+        {
+            if (reward.OriginalCount)
+            {
+                if (reward.OriginalState != ITEM_UNCHANGED)
+                {
+                    item->FSetState(reward.OriginalState);
+                    item->AddToUpdateQueueOf(&recipient);
+                }
+                return;
+            }
+
+            item->RemoveFromUpdateQueueOf(&recipient);
+            recipient.RemoveItem(uint8(reward.Position >> 8), uint8(reward.Position & 255), false);
+            if (item->IsInWorld())
+            {
+                item->RemoveFromWorld();
+                item->DestroyForPlayer(&recipient);
+            }
+            delete item;
+            return;
+        }
+
+        if (reward.OriginalCount)
+            item->SetCount(reward.OriginalCount + reward.Added);
+        else if (recipient.IsInWorld() && !item->IsInWorld())
+            item->AddToWorld();
+
+        if (recipient.IsInWorld())
+        {
+            item->SendUpdateToPlayer(&recipient);
+            recipient.SendNewItem(item, reward.Added, true, false);
+        }
+    }
+
+    bool AppendItemRewards(CharacterDatabaseTransaction const& transaction, Player& recipient,
+        Quest const& quest, Transfer& transfer)
     {
         std::vector<std::pair<uint32, uint32>> rewards;
         for (uint32 i = 0; i < QUEST_REWARDS_COUNT; ++i)
@@ -126,16 +187,44 @@ namespace
         else if (quest.GetRewChoiceItemsCount())
             return false;
 
+        // Validate every entry before reserving inventory, so an invalid template cannot leave a partial reward.
+        for (auto const& reward : rewards)
+            if (!sObjectMgr->GetItemTemplate(reward.first))
+                return false;
+
+        std::vector<Transfer::InventoryReward> inventory;
         std::vector<Transfer::RewardMail> staged;
         for (auto [entry, count] : rewards)
         {
             ItemTemplate const* itemTemplate = sObjectMgr->GetItemTemplate(entry);
-            if (!itemTemplate)
-                return false;
-
             ItemPosCountVec destinations;
-            if (recipient.CanStoreNewItem(NULL_BAG, NULL_SLOT, destinations, entry, count) == EQUIP_ERR_OK)
-                return false;
+
+            if (!itemTemplate->Duration)
+                recipient.CanStoreNewItem(NULL_BAG, NULL_SLOT, destinations, entry, count);
+
+            for (ItemPosCount const& destination : destinations)
+            {
+                Item* item = recipient.GetItemByPos(destination.pos);
+                uint32 const originalCount = item ? item->GetCount() : 0;
+                if (item && (item->IsInTrade() || item->m_lootGenerated))
+                    continue;
+
+                if (!item)
+                {
+                    item = Item::CreateItem(entry, destination.count, &recipient);
+                    if (!item)
+                        continue;
+
+                    item = recipient.StoreItem({destination}, item, false);
+                }
+
+                inventory.push_back({item->GetGUID(), destination.pos, destination.count,
+                    originalCount, item->GetState()});
+                // Stock storage skips merging into looted stacks and does not consume items in trade.
+                item->m_lootGenerated = true;
+                item->SetInTrade();
+                count -= destination.count;
+            }
 
             while (count)
             {
@@ -145,10 +234,38 @@ namespace
                 uint32 const stack = std::min(count, itemTemplate->GetMaxStackSize());
                 std::unique_ptr<Item> item(Item::CreateItem(entry, stack));
                 if (!item)
+                {
+                    for (auto const& reward : inventory)
+                        FinishInventoryReward(recipient, reward, false);
                     return false;
+                }
                 staged.back().Attachments.push_back(std::move(item));
                 count -= stack;
             }
+        }
+
+        for (auto const& reward : inventory)
+        {
+            Item* item = recipient.GetItemByPos(reward.Position);
+            item->RemoveFromUpdateQueueOf(&recipient);
+            if (reward.OriginalCount)
+            {
+                item->SetCount(reward.OriginalCount + reward.Added);
+                item->SetState(ITEM_CHANGED);
+            }
+
+            item->SaveToDB(transaction);
+            if (reward.OriginalCount)
+                item->SetCount(reward.OriginalCount);
+
+            Bag const* bag = item->GetContainer();
+            auto* insert = CharacterDatabase.GetPreparedStatement(CHAR_REP_INVENTORY_ITEM);
+            insert->SetData(0, recipient.GetGUID().GetCounter());
+            insert->SetData(1, bag ? bag->GetGUID().GetCounter() : 0);
+            insert->SetData(2, item->GetSlot());
+            insert->SetData(3, item->GetGUID().GetCounter());
+            transaction->Append(insert);
+            transfer.InventoryRewards.push_back(reward);
         }
 
         for (auto& reward : staged)
@@ -195,7 +312,7 @@ namespace
                 transaction->Append(attachment);
             }
 
-            rewardMails.push_back(std::move(reward));
+            transfer.RewardMails.push_back(std::move(reward));
         }
 
         return true;
@@ -375,6 +492,12 @@ namespace
             return;
         }
 
+        if (recipient->GetTradeData() || recipient->IsNonMeleeSpellCast(false))
+        {
+            FinishTransfer(guid, "Finish trading or casting before requesting catch-up again.");
+            return;
+        }
+
         CharacterDatabaseTransaction transaction = CharacterDatabase.BeginTransaction();
         std::unordered_set<int32> exclusiveGroups;
         for (uint32 id : transfer.Remaining)
@@ -392,7 +515,7 @@ namespace
             if (group > 0 && exclusiveGroups.contains(group))
                 continue;
 
-            if (!AppendOverflowRewards(transaction, *recipient, *quest, transfer.RewardMails))
+            if (!AppendItemRewards(transaction, *recipient, *quest, transfer))
                 continue;
 
             if (group > 0)
@@ -426,10 +549,10 @@ namespace
 
         {
             std::lock_guard lock(pendingBatchesMutex);
-            pendingBatches.emplace(guid, PendingBatch{transfer.InFlight});
+            pendingBatches.emplace(guid, PendingBatch{transfer.InFlight, false, !transfer.InventoryRewards.empty()});
         }
 
-        transactionCallbacks.AddCallback(CharacterDatabase.AsyncCommitTransaction(transaction)).AfterComplete([guid](bool success)
+        auto complete = [guid](bool success, bool indeterminate)
         {
             auto& completed = transfers.at(guid);
             Player* player = ObjectAccessor::FindConnectedPlayer(guid);
@@ -437,17 +560,33 @@ namespace
             {
                 std::lock_guard lock(pendingBatchesMutex);
                 turnInAttempted = pendingBatches.extract(guid).mapped().TurnInAttempted;
+                if (indeterminate && player)
+                    needsRelog.insert(guid);
             }
             bool const progressChanged = player && !completed.RecipientHistory.Matches(*player);
 
+            if (player)
+                for (auto const& reward : completed.InventoryRewards)
+                    FinishInventoryReward(*player, reward, success);
+
             if (!success)
             {
-                FinishTransfer(guid, "The database could not save the last batch. Request catch-up again.");
+                FinishTransfer(guid, indeterminate ? "The database could not confirm the last batch. Log in again before retrying." :
+                    "The database did not save the last batch. Request catch-up again.");
                 return;
             }
 
             if (player)
+            {
                 ApplyCommittedBatch(*player, completed.InFlight);
+                for (auto const& reward : completed.InventoryRewards)
+                    if (Item* item = player->GetItemByPos(reward.Position); item && item->GetGUID() == reward.Guid)
+                        player->ItemAddedQuestCheck(item->GetEntry(), reward.Added);
+
+                if (!progressChanged)
+                    completed.RecipientHistory = QuestHistory(*player);
+            }
+            completed.InventoryRewards.clear();
             PublishRewardMails(completed, player);
 
             for (uint32 id : completed.InFlight)
@@ -468,6 +607,47 @@ namespace
                 return;
             }
             ApplyNextBatch(guid);
+        };
+
+        transactionCallbacks.AddCallback(CharacterDatabase.AsyncCommitTransaction(transaction)).AfterComplete([guid, complete](bool success)
+        {
+            if (success)
+            {
+                complete(true, false);
+                return;
+            }
+
+            // A disconnected COMMIT can return an error after the server has already saved the transaction.
+            auto holder = std::make_shared<SQLQueryHolder<CharacterDatabaseConnection>>();
+            holder->SetSize(2);
+            auto* character = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER);
+            character->SetData(0, guid.GetRawValue());
+            holder->SetPreparedQuery(0, character);
+            auto* rewarded = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_QUESTSTATUSREW);
+            rewarded->SetData(0, guid.GetRawValue());
+            holder->SetPreparedQuery(1, rewarded);
+
+            recoveryCallbacks.AddCallback(CharacterDatabase.DelayQueryHolder(holder)).AfterComplete(
+                [guid, complete](SQLQueryHolderBase const& result)
+            {
+                auto rows = result.GetPreparedResult(1);
+                if (!result.GetPreparedResult(0) || !rows)
+                {
+                    complete(false, true);
+                    return;
+                }
+
+                auto const& inFlight = transfers.at(guid).InFlight;
+                std::size_t saved = 0;
+                do
+                {
+                    uint32 const id = rows->Fetch()[0].Get<uint32>();
+                    saved += std::ranges::find(inFlight, id) != inFlight.end();
+                }
+                while (rows->NextRow());
+
+                complete(saved == inFlight.size(), saved != 0 && saved != inFlight.size());
+            });
         });
     }
 
@@ -477,6 +657,12 @@ namespace
         if (apply && !progressOnlyEnabled)
         {
             handler->SendSysMessage("Quest catch-up transfer is disabled. Use .questcatchup preview.");
+            return true;
+        }
+
+        if (apply && needsRelog.contains(recipient->GetGUID()))
+        {
+            handler->SendSysMessage("Log in again to refresh your quest and inventory state before retrying catch-up.");
             return true;
         }
 
@@ -545,14 +731,25 @@ namespace
             progressOnlyEnabled = sConfigMgr->GetOption<bool>("QuestCatchUp.ProgressOnly", false);
         }
 
-        void OnUpdate(uint32) override { transactionCallbacks.ProcessReadyCallbacks(); }
+        void OnUpdate(uint32) override
+        {
+            transactionCallbacks.ProcessReadyCallbacks();
+            recoveryCallbacks.ProcessReadyCallbacks();
+        }
     };
 
     bool BlockPendingQuest(ObjectGuid guid, uint32 questId, bool turnIn = false)
     {
         std::lock_guard lock(pendingBatchesMutex);
+        if (needsRelog.contains(guid))
+            return true;
+
         auto const batch = pendingBatches.find(guid);
-        if (batch == pendingBatches.end() || std::ranges::find(batch->second.Quests, questId) == batch->second.Quests.end())
+        if (batch == pendingBatches.end())
+            return false;
+
+        if (!batch->second.InventoryReserved &&
+            std::ranges::find(batch->second.Quests, questId) == batch->second.Quests.end())
             return false;
 
         batch->second.TurnInAttempted |= turnIn;
@@ -605,6 +802,12 @@ namespace
                 return !BlockPendingQuest(player->GetGUID(), id, turnIn);
             }
 
+            // While a bag slot is reserved, the player can keep the connection alive while the world keeps ticking.
+            if (opcode != MSG_MOVE_HEARTBEAT && opcode != MSG_MOVE_WORLDPORT_ACK && opcode != MSG_MOVE_TELEPORT_ACK &&
+                opcode != CMSG_TIME_SYNC_RESP && opcode != CMSG_KEEP_ALIVE && opcode != CMSG_LOGOUT_REQUEST &&
+                opcode != CMSG_LOGOUT_CANCEL && BlockPendingQuest(player->GetGUID(), 0))
+                return false;
+
             return true;
         }
     };
@@ -622,6 +825,10 @@ namespace
 
         void OnPlayerLogin(Player* player) override
         {
+            {
+                std::lock_guard lock(pendingBatchesMutex);
+                needsRelog.erase(player->GetGUID());
+            }
             if (!progressOnlyEnabled)
                 return;
 
