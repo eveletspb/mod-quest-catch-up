@@ -10,6 +10,7 @@
 #include "ScriptMgr.h"
 #include "WorldSession.h"
 #include <cstdlib>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -112,6 +113,44 @@ namespace
         return missing;
     }
 
+    std::string_view GetAccessRestriction(Player const& recipient, Quest const& quest)
+    {
+        if (!recipient.SatisfyQuestLevel(&quest, false))
+            return "level";
+        if (!recipient.SatisfyQuestClass(&quest, false))
+            return "class";
+        if (!recipient.SatisfyQuestRace(&quest, false))
+            return "race or faction";
+        if (!recipient.SatisfyQuestReputation(&quest, false))
+            return "reputation";
+        return {};
+    }
+
+    void ReportAccessRestrictions(Player& recipient, Transfer const& transfer)
+    {
+        std::unordered_set<std::string_view> reported;
+        ChatHandler handler(recipient.GetSession());
+        auto report = [&](uint32 id)
+        {
+            if (Quest const* quest = sObjectMgr->GetQuestTemplate(id); quest && !quest->IsDaily())
+            {
+                auto const restriction = GetAccessRestriction(recipient, *quest);
+                if (!restriction.empty() && reported.insert(restriction).second)
+                    handler.PSendSysMessage("Quest {} ({}) is blocked by a {} requirement.",
+                        id, quest->GetTitle(), restriction);
+            }
+        };
+
+        for (uint32 id : transfer.Remaining)
+            report(id);
+
+        auto const chainQuests = GetChainQuests();
+        for (auto const& [id, status] : transfer.SourceHistory.Active)
+            if ((status.Status == QUEST_STATUS_INCOMPLETE || status.Status == QUEST_STATUS_COMPLETE) &&
+                chainQuests.contains(id) && recipient.GetQuestStatus(id) == QUEST_STATUS_NONE)
+                report(id);
+    }
+
     void FinishTransfer(ObjectGuid guid, char const* reason)
     {
         auto transfer = transfers.extract(guid);
@@ -169,10 +208,6 @@ namespace
             insert->SetData(0, guid.GetRawValue());
             insert->SetData(1, id);
             transaction->Append(insert);
-            auto* activate = CharacterDatabase.GetPreparedStatement(CHAR_UPD_CHAR_QUESTSTATUS_REWARDED_ACTIVE_BY_QUEST);
-            activate->SetData(0, guid.GetRawValue());
-            activate->SetData(1, id);
-            transaction->Append(activate);
             auto* removeActive = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHAR_QUESTSTATUS_BY_QUEST);
             removeActive->SetData(0, guid.GetRawValue());
             removeActive->SetData(1, id);
@@ -184,8 +219,13 @@ namespace
 
         if (transfer.InFlight.empty())
         {
-            FinishTransfer(guid, transfer.Remaining.empty() ? "No eligible quests remain." :
-                "Remaining quests require rewards, additional prerequisites or other quest state.");
+            ReportAccessRestrictions(*recipient, transfer);
+            char const* result = "Quest history synchronized.";
+            if (!transfer.Remaining.empty())
+                result = "Some quests require rewards, additional prerequisites or other quest state.";
+            else if (!transfer.Committed)
+                result = "No changes were needed.";
+            FinishTransfer(guid, result);
             return;
         }
 
@@ -234,6 +274,13 @@ namespace
         }
 
         Player* source = recipient->GetSelectedPlayer();
+        if (source && recipient->GetGroup() && recipient->GetGroup() == source->GetGroup() &&
+            recipient->GetTeamId(true) != source->GetTeamId(true))
+        {
+            handler->SendSysMessage("Quest catch-up is unavailable across factions.");
+            return true;
+        }
+
         if (!source || !CanUseSource(*recipient, *source))
         {
             handler->SendSysMessage("Select a character from your faction in your group.");
