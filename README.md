@@ -1,69 +1,73 @@
-# Quest Catch-Up для AzerothCore
+# Quest Catch-Up for AzerothCore
 
-`mod-quest-catch-up` помогает игрокам с разным квестовым прогрессом продолжить цепочки вместе.
-Отстающий персонаж может перенять недостающие завершённые этапы у участника своей группы.
-Перенос идёт в одну сторону, от выбранного персонажа к тому, кто ввёл команду.
+`mod-quest-catch-up` helps players with different levels of quest progress continue quest chains together.
+A character who is behind can catch up on completed steps from a member of their group.
+Progress transfers in one direction, from the targeted character to the character who runs the command.
 
-## Как запустить синхронизацию
+## How to catch up
 
-Допустим, **Vellorin** уже прошёл начало цепочки, а **Mirevash** хочет догнать его.
+Suppose **Vellorin** has already completed the first few quests in a chain and **Mirevash** wants to catch up.
 
-1. Оба персонажа входят в игру, собираются в одну группу и встают на одной карте.
-   Для переноса они должны принадлежать к одной фракции.
-2. **Mirevash** выбирает **Vellorin** в цель и вводит в игровой чат:
+1. Both characters log in, join the same group, and meet on the same map.
+   They must belong to the same faction.
+2. **Mirevash** targets **Vellorin** and runs these commands in the in-game chat.
 
    ```text
    .questcatchup preview
    .questcatchup request
    ```
 
-   `preview` показывает число кандидатов. `request` запускает перенос и выводит итог
-   в системный чат персонажа, который ввёл команду.
-3. Если у **Vellorin** уже есть следующий шаг, он может поделиться им в группе,
-   когда само задание поддерживает передачу. **Mirevash** также может взять доступное
-   задание у квестодателя.
+   `preview` shows how many quests are candidates for transfer. `request` starts the
+   transfer and reports the result in the requesting character's system chat.
+3. If **Vellorin** already has the next quest and it can be shared, he can share it
+   with the group. **Mirevash** can also pick up an available quest from its quest giver.
 
-## Что происходит при переносе
+## What the transfer does
 
-- В историю получателя попадают завершённые этапы цепочек. Если перенесённый этап
-  ещё висит у него в журнале, модуль убирает эту запись как завершённую.
-- Предметы за перенесённые задания выдаются в сумки. Если места не хватает, остаток
-  приходит игровой почтой. Если за квест нужно выбрать одну из нескольких наград,
-  модуль берёт вариант с самой высокой суммарной ценой продажи NPC.
-- Модуль начисляет прямую квестовую репутацию, восстанавливает предусмотренные
-  завершением заклинания, титулы и бонусные очки талантов и обновляет квестовые фазы.
-- Текущие цели, счётчики и незавершённые задания выбранного персонажа не копируются.
-  Перенос исключает ежедневные, еженедельные, ежемесячные задания и задания поиска
-  подземелий. Сезонные завершения учитываются в рамках текущего события.
-- Число сохранённых квестов может быть меньше числа в `preview`. Модуль учитывает
-  требования цепочки, ограничения персонажа и возможность выдать награды.
+- The module adds completed steps in quest chains to the recipient's quest history.
+  If a transferred quest is still in the recipient's quest log, the module removes
+  the entry and records the quest as completed.
+- The module puts item rewards in the recipient's bags and sends any overflow by
+  in-game mail. When a quest offers a choice of rewards, the module selects the
+  option with the highest total vendor sell value.
+- The module grants reputation awarded directly by quests, restores spells,
+  titles, and bonus talent points granted by quest completion, and updates
+  quest-driven phases.
+- The transfer skips the targeted character's current objectives, progress
+  counters, and unfinished quests. It also excludes daily, weekly, and monthly
+  quests, as well as Dungeon Finder quests. Seasonal quest completions count
+  within the current event.
+- The number of saved quests can be lower than the count shown by `preview`.
+  The module checks quest chain prerequisites, character restrictions, and
+  whether it can grant the rewards.
 
-## Включение на тестовом сервере
+## Enabling transfers on a test server
 
-Добавьте модуль в `modules/mod-quest-catch-up` и включите его в сборку worldserver.
-Скопируйте шаблон [mod_quest_catch_up.conf.dist](conf/mod_quest_catch_up.conf.dist)
-в каталог конфигураций модулей worldserver под именем `mod_quest_catch_up.conf`.
-Для тестового сервера задайте:
+Add the module under `modules/mod-quest-catch-up` and include it in the worldserver build.
+Copy the [mod_quest_catch_up.conf.dist](conf/mod_quest_catch_up.conf.dist) template
+to the worldserver module configuration directory as `mod_quest_catch_up.conf`.
+Use the following setting on a test server.
 
 ```ini
 QuestCatchUp.ProgressOnly = 1
 ```
 
-По умолчанию значение равно `0`. В этом режиме игроки могут вызвать `preview`,
-а `request` сообщает, что перенос выключен.
+The default value is `0`. With this default, players can still run `preview`, and
+`request` reports that transfers are disabled.
 
-## Результат проверки на develop
+## Test results on develop
 
-Имена в примере вымышлены, числа взяты из фактической проверки.
+The character names in this example are fictional. The numbers come from the actual test.
 
 ```text
 Quest catch-up preview with Vellorin: 512 completed chain quest(s) missing from your history.
 Quest catch-up with Vellorin: 427 quest(s) saved, 85 skipped.
 ```
 
-После выхода персонажей база подтвердила, что у **Mirevash** стало **1138 завершённых
-квестов вместо 711**. История и журнал **Vellorin** совпали с исходным снимком.
-До переноса **Mirevash** не мог принять *The Spirits of Southwind* (1125) и
-*The Stones That Bind Us* (2681). После переноса сервер подтвердил, что он может
-принять оба задания. У **Vellorin** они были активны и доступны для передачи в группе.
-Проверка прошла через серверные сессии. Оба задания оставили игрокам.
+After both characters logged out, the database confirmed that **Mirevash** had
+**1,138 completed quests**, up from **711**. **Vellorin**'s quest history and quest
+log matched the original snapshot. Before the transfer, **Mirevash** could not
+accept *The Spirits of Southwind* (1125) or *The Stones That Bind Us* (2681).
+After the transfer, the server confirmed that he could accept both quests.
+Both were active in **Vellorin**'s quest log and could be shared with the group.
+The test used server sessions, and both quests were left available for the players.
