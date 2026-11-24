@@ -1,5 +1,7 @@
 # Quest Catch-Up for AzerothCore
 
+![Quest Catch-Up — two adventurers meet at a trail sign](banner.png)
+
 `mod-quest-catch-up` helps players with different levels of quest progress continue quest chains together.
 A character who is behind can catch up on completed steps from a member of their group.
 Progress transfers in one direction, from the targeted character to the character who runs the command.
@@ -41,19 +43,26 @@ Suppose **Vellorin** has already completed the first few quests in a chain and *
   The module checks quest chain prerequisites, character restrictions, and
   whether it can grant the rewards.
 
-## Enabling transfers on a test server
+## Installation and configuration
 
-Add the module under `modules/mod-quest-catch-up` and include it in the worldserver build.
-Copy the [mod_quest_catch_up.conf.dist](conf/mod_quest_catch_up.conf.dist) template
-to the worldserver module configuration directory as `mod_quest_catch_up.conf`.
-Use the following setting on a test server.
+1. From your AzerothCore WotLK 3.3.5a checkout, clone the module.
+
+   ```bash
+   git clone https://github.com/eveletspb/mod-quest-catch-up.git modules/mod-quest-catch-up
+   ```
+
+2. Reconfigure, rebuild, and install `worldserver` using your usual AzerothCore build workflow.
+   The module requires no SQL migrations or client addon.
+3. Copy the installed [mod_quest_catch_up.conf.dist](conf/mod_quest_catch_up.conf.dist)
+   to `mod_quest_catch_up.conf` in the same module configuration directory.
+
+The default value of `QuestCatchUp.ProgressOnly` is `0`. Players can run `preview` with
+this setting. To try experimental transfers on a test realm, set the option to `1`
+and load the updated configuration.
 
 ```ini
 QuestCatchUp.ProgressOnly = 1
 ```
-
-The default value is `0`. With this default, players can still run `preview`, and
-`request` reports that transfers are disabled.
 
 ## Test results on develop
 
@@ -71,3 +80,10 @@ accept *The Spirits of Southwind* (1125) or *The Stones That Bind Us* (2681).
 After the transfer, the server confirmed that he could accept both quests.
 Both were active in **Vellorin**'s quest log and could be shared with the group.
 The test used server sessions, and both quests were left available for the players.
+
+## Author and license
+
+Author — [eveletspb](https://github.com/eveletspb).
+
+Quest Catch-Up is distributed under the [GNU Affero General Public License v3.0](LICENSE)
+(`AGPL-3.0-only`).
