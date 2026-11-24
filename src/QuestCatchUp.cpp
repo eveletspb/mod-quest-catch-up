@@ -16,9 +16,12 @@
 #include "Opcodes.h"
 #include "Player.h"
 #include "QuestDef.h"
+#include "ReputationMgr.h"
 #include "ScriptMgr.h"
+#include "World.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
+#include <cmath>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
@@ -84,8 +87,16 @@ namespace
             uint32 OriginalCount;
             ItemUpdateState OriginalState;
         };
+        struct ReputationReward
+        {
+            int32 Initial;
+            int32 Standing;
+            uint8 Flags;
+            bool RoundedUp;
+        };
         std::vector<RewardMail> RewardMails;
         std::vector<InventoryReward> InventoryRewards;
+        std::unordered_map<uint32, ReputationReward> ReputationRewards;
         uint32 Committed = 0;
     };
 
@@ -100,7 +111,7 @@ namespace
     {
         std::vector<uint32> Quests;
         bool TurnInAttempted = false;
-        bool InventoryReserved = false;
+        bool RewardsReserved = false;
     };
 
     // Quest packets and objective updates may run on the map update threads.
@@ -111,6 +122,104 @@ namespace
     {
         return !quest.IsRepeatable() && !quest.IsDailyOrWeekly() && !quest.IsMonthly() && !quest.IsSeasonal() &&
             !quest.IsDFQuest();
+    }
+
+    void StageQuestReputation(Player& recipient, Quest const& quest, Transfer& transfer)
+    {
+        ReputationMgr const& reputation = recipient.GetReputationMgr();
+        for (uint32 i = 0; i < QUEST_REPUTATIONS_COUNT; ++i)
+        {
+            uint32 const id = quest.RewardFactionId[i];
+            FactionEntry const* faction = sFactionStore.LookupEntry(id);
+            FactionState const* state = faction ? reputation.GetState(faction) : nullptr;
+            if (!state)
+                continue;
+
+            bool hostile = false;
+            for (uint32 index = 0; index < sFactionTemplateStore.GetNumRows(); ++index)
+                if (FactionTemplateEntry const* entry = sFactionTemplateStore.LookupEntry(index); entry && entry->faction == id)
+                {
+                    hostile = recipient.GetTeamId() == TEAM_ALLIANCE ? entry->IsHostileToAlliancePlayers() :
+                        entry->IsHostileToHordePlayers();
+                    break;
+                }
+            if (hostile)
+                continue;
+
+            float amount = quest.RewardFactionValueIdOverride[i] / 100.0f;
+            if (!quest.RewardFactionValueIdOverride[i])
+            {
+                int32 const value = quest.RewardFactionValueId[i];
+                if (QuestFactionRewEntry const* row = sQuestFactionRewardStore.LookupEntry(value < 0 ? 2 : 1))
+                    if (auto const index = static_cast<uint32>(std::abs(value)); index < std::size(row->QuestRewFactionValue))
+                        amount = static_cast<float>(row->QuestRewFactionValue[index]);
+            }
+            if (!amount)
+                continue;
+
+            amount = recipient.CalculateReputationGain(REPUTATION_SOURCE_QUEST, recipient.GetQuestLevel(&quest), amount, id);
+            sScriptMgr->OnPlayerGiveReputation(&recipient, id, amount, REPUTATION_SOURCE_QUEST);
+            amount *= sWorld->getRate(RATE_REPUTATION_GAIN);
+            if (!std::isfinite(amount) || !amount)
+                continue;
+
+            int32 const base = reputation.GetBaseReputation(faction);
+            int32 const current = state->Standing + base;
+            auto& reward = transfer.ReputationRewards.try_emplace(id,
+                Transfer::ReputationReward{current, current, state->Flags, state->roundedUp}).first->second;
+
+            int32 const previous = reward.Standing;
+            float const rounded = reward.RoundedUp ? std::ceil(amount) : std::trunc(amount);
+            reward.RoundedUp = !reward.RoundedUp;
+            reward.Standing = static_cast<int32>(std::clamp(previous + rounded,
+                float(ReputationMgr::Reputation_Bottom), float(ReputationMgr::Reputation_Cap)));
+
+            ReputationRank const rank = ReputationMgr::ReputationToRank(reward.Standing);
+            if (!(reward.Flags & (FACTION_FLAG_INVISIBLE_FORCED | FACTION_FLAG_HIDDEN)) ||
+                reward.Flags & FACTION_FLAG_SPECIAL)
+                reward.Flags |= FACTION_FLAG_VISIBLE;
+            if (rank <= REP_HOSTILE && !(reward.Flags & FACTION_FLAG_PEACE_FORCED))
+                reward.Flags |= FACTION_FLAG_AT_WAR;
+            else if (ReputationMgr::ReputationToRank(previous) <= REP_HOSTILE && rank >= REP_UNFRIENDLY &&
+                faction->CanBeSetAtWar())
+                reward.Flags &= ~FACTION_FLAG_AT_WAR;
+        }
+    }
+
+    void AppendQuestReputation(CharacterDatabaseTransaction const& transaction, Player const& recipient,
+        Transfer const& transfer)
+    {
+        for (auto const& [id, reward] : transfer.ReputationRewards)
+        {
+            auto* remove = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHAR_REPUTATION_BY_FACTION);
+            remove->SetData(0, recipient.GetGUID().GetCounter());
+            remove->SetData(1, uint16(id));
+            transaction->Append(remove);
+
+            auto* insert = CharacterDatabase.GetPreparedStatement(CHAR_INS_CHAR_REPUTATION_BY_FACTION);
+            insert->SetData(0, recipient.GetGUID().GetCounter());
+            insert->SetData(1, uint16(id));
+            auto const* faction = sFactionStore.LookupEntry(id);
+            insert->SetData(2, reward.Standing - recipient.GetReputationMgr().GetBaseReputation(faction));
+            insert->SetData(3, uint16(reward.Flags));
+            transaction->Append(insert);
+        }
+    }
+
+    bool PublishQuestReputation(Player& recipient, Transfer const& transfer)
+    {
+        bool changedWhileSaving = false;
+        ReputationMgr& reputation = recipient.GetReputationMgr();
+        for (auto const& [id, reward] : transfer.ReputationRewards)
+        {
+            FactionEntry const* faction = sFactionStore.LookupEntry(id);
+            int32 const current = reputation.GetReputation(faction);
+            changedWhileSaving |= current != reward.Initial;
+            int32 const standing = current + reward.Standing - reward.Initial;
+            reputation.SetOneFactionReputation(faction, static_cast<float>(standing), false);
+            reputation.SendState(reputation.GetState(faction));
+        }
+        return changedWhileSaving;
     }
 
     void AppendRewardMail(CharacterDatabaseTransaction const& transaction, Transfer::RewardMail& reward)
@@ -578,6 +687,7 @@ namespace
             if (!AppendItemRewards(transaction, *recipient, *quest, transfer))
                 continue;
             AppendQuestTemplateMail(transaction, *recipient, *quest, transfer);
+            StageQuestReputation(*recipient, *quest, transfer);
 
             if (group > 0)
                 exclusiveGroups.insert(group);
@@ -610,8 +720,11 @@ namespace
 
         {
             std::lock_guard lock(pendingBatchesMutex);
-            pendingBatches.emplace(guid, PendingBatch{transfer.InFlight, false, !transfer.InventoryRewards.empty()});
+            bool const reserveRewards = !transfer.InventoryRewards.empty() || !transfer.ReputationRewards.empty();
+            pendingBatches.emplace(guid, PendingBatch{transfer.InFlight, false, reserveRewards});
         }
+
+        AppendQuestReputation(transaction, *recipient, transfer);
 
         auto complete = [guid](bool success, bool indeterminate)
         {
@@ -624,7 +737,7 @@ namespace
                 if (indeterminate && player)
                     needsRelog.insert(guid);
             }
-            bool const progressChanged = player && !completed.RecipientHistory.Matches(*player);
+            bool progressChanged = player && !completed.RecipientHistory.Matches(*player);
 
             if (player)
                 for (auto const& reward : completed.InventoryRewards)
@@ -639,6 +752,7 @@ namespace
 
             if (player)
             {
+                progressChanged |= PublishQuestReputation(*player, completed);
                 ApplyCommittedBatch(*player, completed.InFlight);
                 for (auto const& reward : completed.InventoryRewards)
                     if (Item* item = player->GetItemByPos(reward.Position); item && item->GetGUID() == reward.Guid)
@@ -648,6 +762,7 @@ namespace
                     completed.RecipientHistory = QuestHistory(*player);
             }
             completed.InventoryRewards.clear();
+            completed.ReputationRewards.clear();
             PublishRewardMails(completed, player);
 
             for (uint32 id : completed.InFlight)
@@ -809,7 +924,7 @@ namespace
         if (batch == pendingBatches.end())
             return false;
 
-        if (!batch->second.InventoryReserved &&
+        if (!batch->second.RewardsReserved &&
             std::ranges::find(batch->second.Quests, questId) == batch->second.Quests.end())
             return false;
 
@@ -863,7 +978,7 @@ namespace
                 return !BlockPendingQuest(player->GetGUID(), id, turnIn);
             }
 
-            // While a bag slot is reserved, the player can keep the connection alive while the world keeps ticking.
+            // Keep connection maintenance available while changed rewards await confirmation.
             if (opcode != MSG_MOVE_HEARTBEAT && opcode != MSG_MOVE_WORLDPORT_ACK && opcode != MSG_MOVE_TELEPORT_ACK &&
                 opcode != CMSG_TIME_SYNC_RESP && opcode != CMSG_KEEP_ALIVE && opcode != CMSG_LOGOUT_REQUEST &&
                 opcode != CMSG_LOGOUT_CANCEL && BlockPendingQuest(player->GetGUID(), 0))
